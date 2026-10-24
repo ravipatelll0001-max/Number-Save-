@@ -44,8 +44,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// ---------- नाम: A1, B2, C3 ... Z26, A27, B28 ... ----------
-fun nameFor(i: Int) = "${'A' + (i % 26)}${i + 1}"
+// ---------- नाम: 001A, 002B, 003C ... 026Z, 027A, 028B ... (क्रम सही रहे इसलिए गिनती पहले) ----------
+fun nameFor(i: Int) = String.format(Locale.US, "%03d%c", i + 1, 'A' + (i % 26))
 
 // ---------- नंबर पहचानना ----------
 // आगे 91 / +91 / 0 हो या न हो, फिर 6-9 से शुरू होने वाले 10 अंक
@@ -281,7 +281,7 @@ fun Screen() {
         LazyColumn(Modifier.weight(1f)) {
             itemsIndexed(numbers) { i, n ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(nameFor(i), Modifier.width(56.dp))
+                    Text(nameFor(i), Modifier.width(64.dp))
                     OutlinedTextField(
                         value = n,
                         onValueChange = { numbers[i] = it.filter(Char::isDigit).take(10) },
