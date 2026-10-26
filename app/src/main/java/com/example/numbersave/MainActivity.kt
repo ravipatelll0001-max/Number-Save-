@@ -5,6 +5,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -28,6 +31,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -86,12 +90,67 @@ fun scanImages(ctx: Context, uris: List<Uri>, onDone: (List<String>, Int) -> Uni
     next(0)
 }
 
+// ---------- PDF स्कैन (हर पन्ना फोटो बनाकर पढ़ा जाता है) ----------
+fun scanPdfs(
+    ctx: Context,
+    uris: List<Uri>,
+    onProgress: (String) -> Unit,
+    onDone: (List<String>, Int) -> Unit
+) {
+    val main = Handler(Looper.getMainLooper())
+    Thread {
+        val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val found = mutableListOf<String>()
+        var failed = 0
+        for (uri in uris) {
+            try {
+                val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+                if (pfd == null) {
+                    failed++
+                    continue
+                }
+                val renderer = PdfRenderer(pfd)
+                try {
+                    val total = renderer.pageCount
+                    for (p in 0 until total) {
+                        main.post { onProgress("PDF पन्ना ${p + 1} / $total पढ़ा जा रहा है...") }
+                        val page = renderer.openPage(p)
+                        try {
+                            val scale = maxOf(1f, 2000f / page.width)
+                            val w = (page.width * scale).toInt()
+                            val h = (page.height * scale).toInt()
+                            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                            bmp.eraseColor(Color.WHITE)
+                            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                            try {
+                                val res = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)))
+                                found.addAll(extractNumbers(res.text))
+                            } catch (e: Exception) {
+                                failed++
+                            }
+                            bmp.recycle()
+                        } finally {
+                            page.close()
+                        }
+                    }
+                } finally {
+                    renderer.close()
+                    pfd.close()
+                }
+            } catch (e: Exception) {
+                failed++
+            }
+        }
+        main.post { onDone(found, failed) }
+    }.start()
+}
+
 // ---------- VCF ----------
 fun vcfText(numbers: List<String>, offset: Int): String {
     val sb = StringBuilder()
     numbers.forEachIndexed { k, n ->
         val name = nameFor(offset + k)
-        sb.append("BEGIN:VCARD\r\nVERSION:3.0\r\nN:;$name;;;\r\nFN:$name\r\nTEL;TYPE=CELL:+91$n\r\nEND:VCARD\r\n")
+        sb.append("BEGIN:VCARD\r\nVERSION:3.0\r\nN:;$name;;;\r\nFN:$name\r\nTEL;TYPE=CELL:$n\r\nEND:VCARD\r\n")
     }
     return sb.toString()
 }
@@ -138,7 +197,7 @@ fun saveToSim(ctx: Context, numbers: List<String>, onDone: (Int) -> Unit) {
             try {
                 val cv = ContentValues().apply {
                     put("tag", nameFor(i))
-                    put("number", "+91$n")
+                    put("number", n)
                 }
                 if (ctx.contentResolver.insert(Uri.parse("content://icc/adn"), cv) != null) {
                     ok++
@@ -177,17 +236,26 @@ fun Screen() {
     var lastUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
 
+    fun finishScan(found: List<String>, failed: Int) {
+        val new = found.distinct().filter { it !in numbers }
+        numbers.addAll(new)
+        busy = false
+        status = "${new.size} नए नंबर मिले, कुल ${numbers.size}" +
+            if (failed > 0) " ($failed हिस्से पढ़े नहीं गए)" else ""
+    }
+
     fun handleScan(uris: List<Uri>) {
         if (uris.isEmpty()) return
         busy = true
         status = "स्कैन हो रहा है..."
-        scanImages(ctx, uris) { found, failed ->
-            val new = found.distinct().filter { it !in numbers }
-            numbers.addAll(new)
-            busy = false
-            status = "${new.size} नए नंबर मिले, कुल ${numbers.size}" +
-                if (failed > 0) " ($failed फोटो पढ़ी नहीं गई)" else ""
-        }
+        scanImages(ctx, uris) { found, failed -> finishScan(found, failed) }
+    }
+
+    fun handlePdf(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        busy = true
+        status = "PDF खोली जा रही है..."
+        scanPdfs(ctx, uris, { msg -> status = msg }) { found, failed -> finishScan(found, failed) }
     }
 
     val takePic = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
@@ -195,6 +263,9 @@ fun Screen() {
     }
     val pickPics = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         handleScan(uris)
+    }
+    val pickPdfs = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        handlePdf(uris)
     }
     val simPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
         if (res[Manifest.permission.WRITE_CONTACTS] == true) {
@@ -270,11 +341,11 @@ fun Screen() {
                 contentPadding = PaddingValues(horizontal = 4.dp),
                 onClick = { pickPics.launch("image/*") }
             ) { Text("गैलरी") }
-            OutlinedButton(
-                modifier = Modifier.weight(1f), enabled = numbers.isNotEmpty() && !busy,
+            Button(
+                modifier = Modifier.weight(1f), enabled = !busy,
                 contentPadding = PaddingValues(horizontal = 4.dp),
-                onClick = { confirmClear = true }
-            ) { Text("सब हटाओ") }
+                onClick = { pickPdfs.launch("application/pdf") }
+            ) { Text("PDF") }
         }
         Spacer(Modifier.height(8.dp))
 
@@ -286,7 +357,6 @@ fun Screen() {
                         value = n,
                         onValueChange = { numbers[i] = it.filter(Char::isDigit).take(10) },
                         modifier = Modifier.weight(1f),
-                        prefix = { Text("+91 ") },
                         isError = !isValid(n),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
@@ -299,10 +369,16 @@ fun Screen() {
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "हर फाइल में नंबर:  (कुल ${numbers.size} → $files फाइल)",
+                "कुल ${numbers.size} नंबर → $files फाइल",
                 Modifier.weight(1f),
                 style = MaterialTheme.typography.bodySmall
             )
+            TextButton(
+                enabled = numbers.isNotEmpty() && !busy,
+                onClick = { confirmClear = true }
+            ) { Text("सब हटाओ") }
+            Text("हर फाइल में", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.width(4.dp))
             Box {
                 OutlinedButton(onClick = { menuOpen = true }) { Text("$batch ▼") }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
