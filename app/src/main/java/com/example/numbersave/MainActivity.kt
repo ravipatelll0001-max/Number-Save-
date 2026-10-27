@@ -20,6 +20,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -68,23 +69,32 @@ fun extractNumbers(text: String): List<String> =
 
 fun isValid(n: String) = n.length == 10 && n[0] in '6'..'9'
 
+// एक पेज (फोटो या PDF का पन्ना) का नतीजा
+data class PageResult(val source: String, val numbers: List<String>, val ok: Boolean)
+
 // ---------- स्कैन (एक या कई फोटो, एक-एक करके) ----------
-fun scanImages(ctx: Context, uris: List<Uri>, onDone: (List<String>, Int) -> Unit) {
+fun scanImages(ctx: Context, uris: List<Uri>, onDone: (List<PageResult>) -> Unit) {
     val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    val found = mutableListOf<String>()
-    var failed = 0
+    val results = mutableListOf<PageResult>()
     fun next(i: Int) {
         if (i >= uris.size) {
-            onDone(found, failed)
+            onDone(results)
             return
+        }
+        fun good(list: List<String>) {
+            results.add(PageResult("फोटो", list, true))
+            next(i + 1)
+        }
+        fun bad() {
+            results.add(PageResult("फोटो", emptyList(), false))
+            next(i + 1)
         }
         try {
             rec.process(InputImage.fromFilePath(ctx, uris[i]))
-                .addOnSuccessListener { found.addAll(extractNumbers(it.text)); next(i + 1) }
-                .addOnFailureListener { failed++; next(i + 1) }
+                .addOnSuccessListener { good(extractNumbers(it.text)) }
+                .addOnFailureListener { bad() }
         } catch (e: Exception) {
-            failed++
-            next(i + 1)
+            bad()
         }
     }
     next(0)
@@ -95,18 +105,17 @@ fun scanPdfs(
     ctx: Context,
     uris: List<Uri>,
     onProgress: (String) -> Unit,
-    onDone: (List<String>, Int) -> Unit
+    onDone: (List<PageResult>) -> Unit
 ) {
     val main = Handler(Looper.getMainLooper())
     Thread {
         val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val found = mutableListOf<String>()
-        var failed = 0
+        val results = mutableListOf<PageResult>()
         for (uri in uris) {
             try {
                 val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
                 if (pfd == null) {
-                    failed++
+                    results.add(PageResult("PDF", emptyList(), false))
                     continue
                 }
                 val renderer = PdfRenderer(pfd)
@@ -124,9 +133,9 @@ fun scanPdfs(
                             page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                             try {
                                 val res = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)))
-                                found.addAll(extractNumbers(res.text))
+                                results.add(PageResult("PDF", extractNumbers(res.text), true))
                             } catch (e: Exception) {
-                                failed++
+                                results.add(PageResult("PDF", emptyList(), false))
                             }
                             bmp.recycle()
                         } finally {
@@ -138,10 +147,10 @@ fun scanPdfs(
                     pfd.close()
                 }
             } catch (e: Exception) {
-                failed++
+                results.add(PageResult("PDF", emptyList(), false))
             }
         }
-        main.post { onDone(found, failed) }
+        main.post { onDone(results) }
     }.start()
 }
 
@@ -235,27 +244,48 @@ fun Screen() {
     var confirmClear by remember { mutableStateOf(false) }
     var lastUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
+    var pagesTotal by remember { mutableStateOf(prefs.getInt("pages", 0)) }
+    var lastPages by remember { mutableStateOf<List<PageResult>>(emptyList()) }
+    var dupList by remember { mutableStateOf<List<Pair<String, Int>>>(emptyList()) }
+    var showDup by remember { mutableStateOf(false) }
+    var showPages by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        snapshotFlow { pagesTotal }.collect { prefs.edit().putInt("pages", it).apply() }
+    }
 
-    fun finishScan(found: List<String>, failed: Int) {
-        val new = found.distinct().filter { it !in numbers }
+    fun finishScan(results: List<PageResult>) {
+        val all = results.flatMap { it.numbers }
+        val counts = LinkedHashMap<String, Int>()
+        all.forEach { counts[it] = (counts[it] ?: 0) + 1 }
+        val dups = mutableListOf<Pair<String, Int>>()
+        for ((n, c) in counts) {
+            val total = c + (if (n in numbers) 1 else 0)
+            if (total > 1) dups.add(Pair(n, total))
+        }
+        val new = counts.keys.filter { it !in numbers }
         numbers.addAll(new)
+        pagesTotal += results.size
+        lastPages = results
+        dupList = dups
         busy = false
-        status = "${new.size} नए नंबर मिले, कुल ${numbers.size}" +
-            if (failed > 0) " ($failed हिस्से पढ़े नहीं गए)" else ""
+        val failedPages = results.count { !it.ok }
+        status = "${results.size} पेज पढ़े गए, ${all.size} नंबर मिले (${new.size} नए)" +
+            (if (dups.isNotEmpty()) ", ${dups.size} डुप्लीकेट" else "") +
+            (if (failedPages > 0) ", $failedPages पेज पढ़े नहीं गए" else "")
     }
 
     fun handleScan(uris: List<Uri>) {
         if (uris.isEmpty()) return
         busy = true
         status = "स्कैन हो रहा है..."
-        scanImages(ctx, uris) { found, failed -> finishScan(found, failed) }
+        scanImages(ctx, uris) { results -> finishScan(results) }
     }
 
     fun handlePdf(uris: List<Uri>) {
         if (uris.isEmpty()) return
         busy = true
         status = "PDF खोली जा रही है..."
-        scanPdfs(ctx, uris, { msg -> status = msg }) { found, failed -> finishScan(found, failed) }
+        scanPdfs(ctx, uris, { msg -> status = msg }) { results -> finishScan(results) }
     }
 
     val takePic = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
@@ -305,11 +335,65 @@ fun Screen() {
                 TextButton(onClick = {
                     numbers.clear()
                     lastUris = emptyList()
+                    pagesTotal = 0
+                    lastPages = emptyList()
+                    dupList = emptyList()
                     status = "लिस्ट खाली"
                     confirmClear = false
                 }) { Text("हाँ, हटाओ") }
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("नहीं") } }
+        )
+    }
+
+    if (showDup) {
+        AlertDialog(
+            onDismissRequest = { showDup = false },
+            title = { Text("डुप्लीकेट नंबर") },
+            text = {
+                if (dupList.isEmpty()) {
+                    Text("कोई डुप्लीकेट नहीं बचा")
+                } else {
+                    LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                        items(dupList) { d ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("${d.first} — ${d.second} बार", Modifier.weight(1f))
+                                TextButton(onClick = {
+                                    numbers.remove(d.first)
+                                    dupList = dupList.filter { it.first != d.first }
+                                }) { Text("हटाओ") }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showDup = false }) { Text("बंद करें") } },
+            dismissButton = {
+                TextButton(onClick = {
+                    dupList = emptyList()
+                    showDup = false
+                }) { Text("सूची साफ़ करो") }
+            }
+        )
+    }
+
+    if (showPages) {
+        AlertDialog(
+            onDismissRequest = { showPages = false },
+            title = { Text("पेज का हिसाब") },
+            text = {
+                LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    itemsIndexed(lastPages) { i, p ->
+                        val line = when {
+                            !p.ok -> "पेज ${i + 1} (${p.source}): पढ़ा नहीं गया"
+                            p.numbers.isEmpty() -> "पेज ${i + 1} (${p.source}): 0 नंबर ⚠"
+                            else -> "पेज ${i + 1} (${p.source}): ${p.numbers.size} नंबर"
+                        }
+                        Text(line, Modifier.padding(vertical = 4.dp))
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showPages = false }) { Text("बंद करें") } }
         )
     }
 
@@ -322,6 +406,19 @@ fun Screen() {
                 "लाल निशान वाले नंबर ठीक कीजिए (10 अंक, 6-9 से शुरू)",
                 color = MaterialTheme.colorScheme.error
             )
+        }
+        if (pagesTotal > 0) {
+            Text("कुल स्कैन किए पेज: $pagesTotal", style = MaterialTheme.typography.bodySmall)
+        }
+        if (lastPages.isNotEmpty() || dupList.isNotEmpty()) {
+            Row {
+                if (lastPages.isNotEmpty()) {
+                    TextButton(onClick = { showPages = true }) { Text("पेज का हिसाब") }
+                }
+                if (dupList.isNotEmpty()) {
+                    TextButton(onClick = { showDup = true }) { Text("डुप्लीकेट देखें (${dupList.size})") }
+                }
+            }
         }
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
